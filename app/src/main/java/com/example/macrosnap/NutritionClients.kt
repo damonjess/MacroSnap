@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.util.Base64
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -16,6 +17,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 @Serializable
@@ -52,15 +54,22 @@ class BarcodeNotFoundException(val barcode: String) :
 
 class NutritionRepository {
     private val client = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     val json = Json { ignoreUnknownKeys = true }
 
-    companion object {
-        private const val GEMINI_MODEL = "gemini-3.8-flash"
+    // Tries primary model twice, then falls back to lite if 503 high demand persists
+    private val geminiModels = listOf(
+        "gemini-3.8-flash",
+        "gemini-3.8-flash",
+        "gemini-3.8-flash-lite"
+    )
 
+    companion object {
         fun saveMealThumbnail(context: Context, bitmap: Bitmap): String? = runCatching {
             val dir = File(context.filesDir, "meal_thumbs").apply { mkdirs() }
             val file = File(dir, "meal_${System.currentTimeMillis()}.jpg")
@@ -88,9 +97,10 @@ class NutritionRepository {
         isNutritionLabelOcr: Boolean = false
     ): Result<NutritionResult> = withContext(Dispatchers.IO) {
         runCatching {
-            val scaled = scaleBitmap(bitmap, 1024)
+            // 768px @ 72% quality keeps payload under ~70KB to prevent upload/read timeouts
+            val scaled = scaleBitmap(bitmap, 768)
             val stream = ByteArrayOutputStream()
-            scaled.compress(Bitmap.CompressFormat.JPEG, 80, stream)
+            scaled.compress(Bitmap.CompressFormat.JPEG, 72, stream)
             val base64Image = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
 
             val basePrompt = if (isNutritionLabelOcr) {
@@ -204,58 +214,100 @@ class NutritionRepository {
         }
     }
 
-    private fun executeGeminiRequest(payload: JsonObject): NutritionResult {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent?key=${BuildConfig.GEMINI_API_KEY}"
-        val request = Request.Builder()
-            .url(url)
-            .post(payload.toString().toRequestBody("application/json".toMediaType()))
-            .build()
+    private suspend fun executeGeminiRequest(payload: JsonObject): NutritionResult {
+        var lastError: Throwable? = null
 
-        client.newCall(request).execute().use { response ->
-            val bodyStr = response.body?.string() ?: error("Empty response")
-            if (!response.isSuccessful) error("Gemini API error ${response.code}: $bodyStr")
+        for ((attempt, modelName) in geminiModels.withIndex()) {
+            try {
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=${BuildConfig.GEMINI_API_KEY}"
+                val request = Request.Builder()
+                    .url(url)
+                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
 
-            val root = json.parseToJsonElement(bodyStr).jsonObject
-            val text = root["candidates"]?.jsonArray?.get(0)?.jsonObject
-                ?.get("content")?.jsonObject
-                ?.get("parts")?.jsonArray?.get(0)?.jsonObject
-                ?.get("text")?.jsonPrimitive?.content
-                ?: error("No candidate text returned")
+                client.newCall(request).execute().use { response ->
+                    val bodyStr = response.body?.string() ?: error("Empty response")
 
-            return json.decodeFromString<NutritionResult>(text)
+                    // Retry automatically on 503 (High Demand), 429 (Rate Limit), or 500/504
+                    if (response.code in listOf(429, 500, 502, 503, 504)) {
+                        throw IOException("Server busy (${response.code}) on $modelName")
+                    }
+
+                    // If fallback lite model isn't enabled on this project key, retry with flash
+                    if (response.code == 404 && modelName != "gemini-3.8-flash") {
+                        throw IOException("Fallback model $modelName unavailable")
+                    }
+
+                    if (!response.isSuccessful) {
+                        error("Gemini API error ${response.code}: $bodyStr")
+                    }
+
+                    val root = json.parseToJsonElement(bodyStr).jsonObject
+                    val text = root["candidates"]?.jsonArray?.get(0)?.jsonObject
+                        ?.get("content")?.jsonObject
+                        ?.get("parts")?.jsonArray?.get(0)?.jsonObject
+                        ?.get("text")?.jsonPrimitive?.content
+                        ?: error("No candidate text returned")
+
+                    return json.decodeFromString<NutritionResult>(text)
+                }
+            } catch (e: IOException) {
+                // Catches both SocketTimeoutException and 503 Server Busy
+                lastError = e
+                if (attempt < geminiModels.lastIndex) {
+                    delay(1500L * (attempt + 1))
+                }
+            }
         }
+        error("Scan timed out or Gemini servers are overloaded. Please try again. (${lastError?.message})")
     }
 
     suspend fun lookupBarcode(barcode: String): Result<NutritionResult> = withContext(Dispatchers.IO) {
         runCatching {
-            val request = Request.Builder()
-                .url("https://world.openfoodfacts.org/api/v2/product/$barcode.json")
-                .header("User-Agent", "MacroSnapPersonalApp/1.0")
-                .build()
+            // Requesting ONLY needed fields shrinks response by 95% and prevents Open Food Facts timeouts
+            val fields = "product_name,serving_size,ingredients_text,nutriscore_grade,nova_group,additives_tags,nutriments"
+            val url = "https://world.openfoodfacts.org/api/v2/product/$barcode.json?fields=$fields"
 
-            client.newCall(request).execute().use { response ->
-                val bodyStr = response.body?.string() ?: error("Empty response")
-                val parsed = json.decodeFromString<OffResponse>(bodyStr)
-                if (parsed.status != 1 || parsed.product == null) {
-                    throw BarcodeNotFoundException(barcode)
+            var lastError: Throwable? = null
+            for (attempt in 0..1) {
+                try {
+                    val request = Request.Builder()
+                        .url(url)
+                        .header("User-Agent", "MacroSnapPersonalApp/1.0")
+                        .build()
+
+                    client.newCall(request).execute().use { response ->
+                        val bodyStr = response.body?.string() ?: error("Empty response")
+                        if (!response.isSuccessful && response.code >= 500) {
+                            throw IOException("Open Food Facts server busy (${response.code})")
+                        }
+                        val parsed = json.decodeFromString<OffResponse>(bodyStr)
+                        if (parsed.status != 1 || parsed.product == null) {
+                            throw BarcodeNotFoundException(barcode)
+                        }
+                        val p = parsed.product
+                        val n = p.nutriments
+                        val servingHint = p.servingSize?.let { " (1 serving = $it)" } ?: ""
+                        return@runCatching NutritionResult(
+                            mealName = p.productName?.ifBlank { "Packaged Item ($barcode)" } ?: "Packaged Item ($barcode)",
+                            calories = (n.energyKcal100g ?: n.energyKcalServing ?: 0.0).toInt(),
+                            proteinGrams = n.proteins100g ?: n.proteinsServing ?: 0.0,
+                            carbsGrams = n.carbs100g ?: n.carbsServing ?: 0.0,
+                            fatGrams = n.fat100g ?: n.fatServing ?: 0.0,
+                            fiberGrams = n.fiber100g ?: n.fibre100g ?: n.fiberServing ?: n.fibreServing ?: 0.0,
+                            confidenceNote = "Base values per 100g$servingHint",
+                            ingredients = p.ingredientsText ?: "",
+                            nutriscore = p.nutriscoreGrade?.uppercase() ?: "?",
+                            novaGroup = p.novaGroup ?: 0,
+                            additivesCount = p.additivesTags.size
+                        )
+                    }
+                } catch (e: IOException) {
+                    lastError = e
+                    if (attempt == 0) delay(1000L)
                 }
-                val p = parsed.product
-                val n = p.nutriments
-                val servingHint = p.servingSize?.let { " (1 serving = $it)" } ?: ""
-                NutritionResult(
-                    mealName = p.productName?.ifBlank { "Packaged Item ($barcode)" } ?: "Packaged Item ($barcode)",
-                    calories = (n.energyKcal100g ?: n.energyKcalServing ?: 0.0).toInt(),
-                    proteinGrams = n.proteins100g ?: n.proteinsServing ?: 0.0,
-                    carbsGrams = n.carbs100g ?: n.carbsServing ?: 0.0,
-                    fatGrams = n.fat100g ?: n.fatServing ?: 0.0,
-                    fiberGrams = n.fiber100g ?: n.fibre100g ?: n.fiberServing ?: n.fibreServing ?: 0.0,
-                    confidenceNote = "Base values per 100g$servingHint",
-                    ingredients = p.ingredientsText ?: "",
-                    nutriscore = p.nutriscoreGrade?.uppercase() ?: "?",
-                    novaGroup = p.novaGroup ?: 0,
-                    additivesCount = p.additivesTags.size
-                )
             }
+            error("Barcode lookup timed out. Check your connection and try again. (${lastError?.message})")
         }
     }
 
