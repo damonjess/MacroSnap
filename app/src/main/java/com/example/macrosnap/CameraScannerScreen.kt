@@ -18,7 +18,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -32,7 +31,6 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -45,8 +43,8 @@ import java.util.concurrent.Executors
 @OptIn(ExperimentalGetImage::class)
 @Composable
 fun CameraScannerScreen(
-    initialLabelOcrMode: Boolean = false,
-    onPhotoCaptured: (bitmap: Bitmap, userHint: String, isLabelOcr: Boolean) -> Unit,
+    initialCaptureMode: ScannerCaptureMode = ScannerCaptureMode.MEAL_OR_BARCODE,
+    onPhotoCaptured: (bitmap: Bitmap, userHint: String, captureMode: ScannerCaptureMode) -> Unit,
     onBarcodeDetected: (String) -> Unit,
     onClose: () -> Unit
 ) {
@@ -57,7 +55,7 @@ fun CameraScannerScreen(
     var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
     var barcodeHandled by remember { mutableStateOf(false) }
 
-    var isLabelOcrMode by remember { mutableStateOf(initialLabelOcrMode) }
+    var captureMode by remember { mutableStateOf(initialCaptureMode) }
     var userHint by remember { mutableStateOf("") }
 
     val quickHints = listOf(
@@ -77,7 +75,7 @@ fun CameraScannerScreen(
                     BitmapFactory.decodeStream(stream)
                 }
             }.getOrNull()?.let { bmp ->
-                onPhotoCaptured(bmp, userHint.trim(), isLabelOcrMode)
+                onPhotoCaptured(bmp, userHint.trim(), captureMode)
             }
         }
     }
@@ -87,6 +85,12 @@ fun CameraScannerScreen(
             cameraExecutor.shutdown()
             barcodeScanner.close()
         }
+    }
+
+    val modeAccentColor = when (captureMode) {
+        ScannerCaptureMode.MEAL_OR_BARCODE -> Color(0xFF10B981)
+        ScannerCaptureMode.NUTRITION_LABEL_OCR -> Color(0xFF06B6D4)
+        ScannerCaptureMode.INGREDIENTS_OCR -> Color(0xFFFBBF24)
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
@@ -113,7 +117,8 @@ fun CameraScannerScreen(
                         .also { imageAnalysis ->
                             imageAnalysis.setAnalyzer(cameraExecutor) { proxy ->
                                 val mediaImage = proxy.image
-                                if (mediaImage != null && !barcodeHandled && !isLabelOcrMode) {
+                                val allowBarcode = captureMode == ScannerCaptureMode.MEAL_OR_BARCODE
+                                if (mediaImage != null && !barcodeHandled && allowBarcode) {
                                     val inputImage = InputImage.fromMediaImage(
                                         mediaImage,
                                         proxy.imageInfo.rotationDegrees
@@ -121,7 +126,7 @@ fun CameraScannerScreen(
                                     barcodeScanner.process(inputImage)
                                         .addOnSuccessListener { barcodes ->
                                             val raw = barcodes.firstOrNull()?.rawValue
-                                            if (!raw.isNullOrBlank() && !barcodeHandled && !isLabelOcrMode) {
+                                            if (!raw.isNullOrBlank() && !barcodeHandled && allowBarcode) {
                                                 barcodeHandled = true
                                                 onBarcodeDetected(raw)
                                             }
@@ -147,15 +152,16 @@ fun CameraScannerScreen(
             }
         )
 
-        // Centered Reticle Box for Barcodes, Nutrition Labels & Meal Framing
+        // Centered Reticle Box
         Canvas(modifier = Modifier.fillMaxSize()) {
-            val boxWidth = size.width * if (isLabelOcrMode) 0.80f else 0.72f
-            val boxHeight = size.height * if (isLabelOcrMode) 0.44f else 0.26f
+            val isTextOcr = captureMode != ScannerCaptureMode.MEAL_OR_BARCODE
+            val boxWidth = size.width * if (isTextOcr) 0.84f else 0.72f
+            val boxHeight = size.height * if (isTextOcr) 0.42f else 0.26f
             val left = (size.width - boxWidth) / 2f
             val top = (size.height - boxHeight) / 2.3f
 
             drawRoundRect(
-                color = if (isLabelOcrMode) Color(0xFF06B6D4).copy(alpha = 0.85f) else Color.White.copy(alpha = 0.65f),
+                color = if (isTextOcr) modeAccentColor.copy(alpha = 0.88f) else Color.White.copy(alpha = 0.65f),
                 topLeft = Offset(left, top),
                 size = Size(boxWidth, boxHeight),
                 cornerRadius = CornerRadius(16.dp.toPx()),
@@ -163,72 +169,83 @@ fun CameraScannerScreen(
             )
         }
 
-        // Top Bar: Close & Mode Toggle (AI Meal / Barcode vs Nutrition Label OCR)
-        Row(
+        // Top Bar: Close + 3-Mode Selector Pill
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
                 .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            IconButton(
-                onClick = onClose,
-                modifier = Modifier.background(Color.Black.copy(alpha = 0.5f), CircleShape)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White)
-            }
-
-            Surface(
-                onClick = { isLabelOcrMode = !isLabelOcrMode },
-                color = if (isLabelOcrMode) Color(0xFF06B6D4) else Color.Black.copy(alpha = 0.65f),
-                shape = RoundedCornerShape(20.dp),
-                modifier = Modifier.semantics(mergeDescendants = true) {}
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                IconButton(
+                    onClick = onClose,
+                    modifier = Modifier.background(Color.Black.copy(alpha = 0.55f), CircleShape)
                 ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.ReceiptLong,
-                        contentDescription = null,
-                        tint = if (isLabelOcrMode) Color(0xFF042F2E) else Color.White,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Text(
-                        text = if (isLabelOcrMode) "Label OCR Mode: ON" else "Scan Nutrition Label",
-                        color = if (isLabelOcrMode) Color(0xFF042F2E) else Color.White,
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.White)
+                }
+
+                Surface(
+                    color = Color.Black.copy(alpha = 0.65f),
+                    shape = RoundedCornerShape(18.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        ModeTabChip(
+                            label = "Meal",
+                            selected = captureMode == ScannerCaptureMode.MEAL_OR_BARCODE,
+                            activeColor = Color(0xFF10B981),
+                            onClick = { captureMode = ScannerCaptureMode.MEAL_OR_BARCODE }
+                        )
+                        ModeTabChip(
+                            label = "Macros",
+                            selected = captureMode == ScannerCaptureMode.NUTRITION_LABEL_OCR,
+                            activeColor = Color(0xFF06B6D4),
+                            onClick = { captureMode = ScannerCaptureMode.NUTRITION_LABEL_OCR }
+                        )
+                        ModeTabChip(
+                            label = "Ingredients",
+                            selected = captureMode == ScannerCaptureMode.INGREDIENTS_OCR,
+                            activeColor = Color(0xFFFBBF24),
+                            onClick = { captureMode = ScannerCaptureMode.INGREDIENTS_OCR }
+                        )
+                    }
                 }
             }
         }
 
-        // Bottom Controls: Pre-capture AI Hint, Quick Chips, Gallery Picker & Shutter
+        // Bottom Controls
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .background(Color.Black.copy(alpha = 0.72f))
+                .background(Color.Black.copy(alpha = 0.74f))
                 .navigationBarsPadding()
                 .padding(horizontal = 16.dp, vertical = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Text(
-                text = if (isLabelOcrMode) {
-                    "Frame the package's Nutrition Facts table and tap capture"
-                } else {
-                    "Auto-scans barcodes in box • Tap shutter or gallery for AI meal analysis"
+                text = when (captureMode) {
+                    ScannerCaptureMode.MEAL_OR_BARCODE ->
+                        "Auto-scans barcodes in box • Tap shutter for AI meal analysis"
+                    ScannerCaptureMode.NUTRITION_LABEL_OCR ->
+                        "Frame the Per 100g / Nutrition table and tap capture"
+                    ScannerCaptureMode.INGREDIENTS_OCR ->
+                        "Frame the package's Ingredients list to check Good vs. Bad ingredients"
                 },
-                color = Color.White.copy(alpha = 0.9f),
+                color = Color.White.copy(alpha = 0.92f),
                 style = MaterialTheme.typography.labelMedium
             )
 
-            if (!isLabelOcrMode) {
+            if (captureMode == ScannerCaptureMode.MEAL_OR_BARCODE) {
                 OutlinedTextField(
                     value = userHint,
                     onValueChange = { userHint = it },
@@ -304,7 +321,7 @@ fun CameraScannerScreen(
                                 override fun onCaptureSuccess(image: ImageProxy) {
                                     val rotated = image.toBitmap().rotate(image.imageInfo.rotationDegrees)
                                     image.close()
-                                    onPhotoCaptured(rotated, userHint.trim(), isLabelOcrMode)
+                                    onPhotoCaptured(rotated, userHint.trim(), captureMode)
                                 }
                             }
                         )
@@ -312,7 +329,7 @@ fun CameraScannerScreen(
                     modifier = Modifier.size(72.dp),
                     shape = CircleShape,
                     colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = if (isLabelOcrMode) Color(0xFF06B6D4) else Color(0xFF10B981),
+                        containerColor = modeAccentColor,
                         contentColor = Color(0xFF042F2E)
                     )
                 ) {
@@ -326,6 +343,30 @@ fun CameraScannerScreen(
                 Spacer(modifier = Modifier.size(52.dp))
             }
         }
+    }
+}
+
+@Composable
+private fun ModeTabChip(
+    label: String,
+    selected: Boolean,
+    activeColor: Color,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        color = if (selected) activeColor else Color.Transparent,
+        shape = RoundedCornerShape(14.dp)
+    ) {
+        Text(
+            text = label,
+            color = if (selected) Color(0xFF042F2E) else Color.White,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            softWrap = false,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+        )
     }
 }
 

@@ -1,6 +1,7 @@
 package com.example.macrosnap
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -14,31 +15,49 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Science
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 @Composable
 fun ReviewNutritionDialog(
     initial: NutritionResult,
     isBarcode: Boolean,
+    isLabelOrIngredientsOcr: Boolean = false,
     initialCategory: MealCategory = MealCategory.defaultForTimestamp(),
     isEditing: Boolean = false,
+    onAnalyzeIngredients: (suspend (productName: String, ingredientsText: String) -> Result<IngredientAnalysisResponse>)? = null,
+    onSuggestAlternatives: (suspend (productName: String, brandName: String, score: Int, negativesSummary: String) -> Result<List<HealthierAlternative>>)? = null,
     onDismiss: () -> Unit,
     onConfirm: (result: NutritionResult, category: MealCategory) -> Unit
 ) {
+    val scope = rememberCoroutineScope()
     var name by remember { mutableStateOf(initial.mealName) }
     var selectedCategory by remember { mutableStateOf(initialCategory) }
-    var portionGrams by remember { mutableStateOf("100") }
+
+    val baseReferenceGrams = remember(initial, isBarcode) {
+        if (isBarcode) {
+            100
+        } else {
+            initial.subItems.firstOrNull()?.grams?.takeIf { it > 0 } ?: 100
+        }
+    }
+    val showGramInput = (isBarcode || isLabelOrIngredientsOcr) && !isEditing
+
+    var portionGrams by remember { mutableStateOf(baseReferenceGrams.toString()) }
     var multiplier by remember { mutableFloatStateOf(1f) }
     var subItems by remember { mutableStateOf(initial.subItems) }
 
@@ -47,6 +66,16 @@ fun ReviewNutritionDialog(
     var carbs by remember { mutableStateOf("%.1f".format(initial.carbsGrams)) }
     var fat by remember { mutableStateOf("%.1f".format(initial.fatGrams)) }
     var fiber by remember { mutableStateOf("%.1f".format(initial.fiberGrams)) }
+
+    var healthScore by remember { mutableIntStateOf(initial.healthScore) }
+    var healthVerdict by remember { mutableStateOf(initial.healthVerdict) }
+    var ingredientFacts by remember { mutableStateOf(initial.ingredientFacts) }
+    var additiveDetails by remember { mutableStateOf(initial.additiveDetails) }
+    var alternatives by remember { mutableStateOf(initial.alternatives) }
+    var isLoadingAlternatives by remember { mutableStateOf(false) }
+    var isAnalyzingIngredients by remember { mutableStateOf(false) }
+    var ingredientError by remember { mutableStateOf<String?>(null) }
+    var activeModelBadge by remember { mutableStateOf(initial.modelUsed) }
 
     fun applyTotalsFromSubItemsAndMultiplier(items: List<DetectedFoodItem>, mult: Float) {
         if (items.isNotEmpty()) {
@@ -79,6 +108,39 @@ fun ReviewNutritionDialog(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                if (activeModelBadge.isNotBlank()) {
+                    val isPrimary = activeModelBadge == "gemini-3.8-flash"
+                    val badgeColor = if (isPrimary) AccentEmerald else AccentCyan
+                    Surface(
+                        color = badgeColor.copy(alpha = 0.14f),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.35f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.AutoAwesome,
+                                contentDescription = null,
+                                tint = badgeColor,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = if (isPrimary) {
+                                    "Processed by $activeModelBadge"
+                                } else {
+                                    "Processed by $activeModelBadge (failover)"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = badgeColor,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
@@ -87,71 +149,86 @@ fun ReviewNutritionDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                // Meal Category Selector
                 Text("Meal Category", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
                 Row(
-                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     MealCategory.entries.forEach { cat ->
-                        FilterChip(
-                            selected = selectedCategory == cat,
+                        val isSelected = selectedCategory == cat
+                        Surface(
                             onClick = { selectedCategory = cat },
-                            label = { Text(cat.displayName, style = MaterialTheme.typography.labelSmall) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                containerColor = CardElevated,
-                                labelColor = TextSecondary,
-                                selectedContainerColor = AccentEmerald,
-                                selectedLabelColor = Color(0xFF042F2E)
+                            color = if (isSelected) AccentEmerald else CardElevated,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                text = cat.displayName,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isSelected) Color(0xFF042F2E) else TextSecondary,
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                                modifier = Modifier.padding(vertical = 9.dp, horizontal = 2.dp)
                             )
-                        )
+                        }
                     }
                 }
 
-                // Portion scaling: grams for barcode, multiplier chips for AI/manual
-                if (isBarcode && !isEditing) {
+                if (showGramInput) {
                     OutlinedTextField(
                         value = portionGrams,
                         onValueChange = { newGrams ->
                             portionGrams = newGrams
                             val g = newGrams.toDoubleOrNull()
-                            if (g != null) {
-                                val ratio = g / 100.0
-                                cals = (initial.calories * ratio).toInt().toString()
+                            if (g != null && baseReferenceGrams > 0) {
+                                val ratio = g / baseReferenceGrams.toDouble()
+                                cals = (initial.calories * ratio).roundToInt().toString()
                                 protein = "%.1f".format(initial.proteinGrams * ratio)
                                 carbs = "%.1f".format(initial.carbsGrams * ratio)
                                 fat = "%.1f".format(initial.fatGrams * ratio)
                                 fiber = "%.1f".format(initial.fiberGrams * ratio)
                             }
                         },
-                        label = { Text("Portion Weight (g) — scales from 100g") },
+                        label = { Text("Portion Weight (g) — scales from ${baseReferenceGrams}g") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
-                } else {
-                    Text("Portion Multiplier", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf(0.5f to "0.5x", 1f to "1x", 1.5f to "1.5x", 2f to "2x").forEach { (m, label) ->
-                            FilterChip(
-                                selected = multiplier == m,
-                                onClick = {
-                                    multiplier = m
-                                    applyTotalsFromSubItemsAndMultiplier(subItems, m)
-                                },
-                                label = { Text(label, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold) },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    containerColor = CardElevated,
-                                    labelColor = TextSecondary,
-                                    selectedContainerColor = AccentCyan,
-                                    selectedLabelColor = Color(0xFF042F2E)
-                                )
+                }
+
+                Text("Portion Multiplier", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(0.5f to "0.5x", 1f to "1x", 1.5f to "1.5x", 2f to "2x").forEach { (m, label) ->
+                        val selected = multiplier == m
+                        Surface(
+                            onClick = {
+                                multiplier = m
+                                if (showGramInput) {
+                                    val scaledGrams = (baseReferenceGrams * m).roundToInt()
+                                    portionGrams = scaledGrams.toString()
+                                }
+                                applyTotalsFromSubItemsAndMultiplier(subItems, m)
+                            },
+                            color = if (selected) AccentCyan else CardElevated,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                text = label,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = if (selected) Color(0xFF042F2E) else TextSecondary,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(vertical = 8.dp)
                             )
                         }
                     }
                 }
 
-                // Multi-item breakdown toggles
                 if (subItems.isNotEmpty()) {
                     Surface(
                         color = CardElevated,
@@ -242,59 +319,76 @@ fun ReviewNutritionDialog(
                     )
                 }
 
-                if (initial.nutriscore != "?" || initial.novaGroup > 0 || initial.ingredients.isNotBlank()) {
-                    Surface(
-                        color = CardElevated,
-                        shape = RoundedCornerShape(16.dp),
-                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
-                    ) {
-                        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text("Quality & Ingredients", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                                val scoreColor = when (initial.nutriscore) {
-                                    "A", "B" -> Color(0xFF10B981)
-                                    "C" -> Color(0xFFF59E0B)
-                                    "D", "E" -> Color(0xFFEF4444)
-                                    else -> TextSecondary
+                // Full Yuka-Style Report Card (Score 0/100, Negatives, Positives, Expandable Additives & Deep-Dive Modals)
+                val showYukaSection = isBarcode ||
+                    isLabelOrIngredientsOcr ||
+                    initial.nutriscore != "?" ||
+                    initial.ingredients.isNotBlank() ||
+                    additiveDetails.isNotEmpty() ||
+                    ingredientFacts.isNotEmpty()
+
+                if (showYukaSection) {
+                    YukaProductReportSection(
+                        productName = name,
+                        brandName = initial.brandName,
+                        calories100g = initial.calories,
+                        saturates100g = initial.saturates100g,
+                        sugars100g = initial.sugars100g,
+                        salt100g = initial.salt100g,
+                        protein100g = initial.proteinGrams,
+                        fiber100g = initial.fiberGrams,
+                        nutriscore = initial.nutriscore,
+                        novaGroup = initial.novaGroup,
+                        rawIngredients = initial.ingredients,
+                        additives = additiveDetails,
+                        aiScoreOverride = healthScore,
+                        aiVerdict = healthVerdict,
+                        ingredientFacts = ingredientFacts,
+                        alternatives = alternatives,
+                        isLoadingAlternatives = isLoadingAlternatives,
+                        onRequestAlternatives = if (onSuggestAlternatives != null) {
+                            { score, negativesSummary ->
+                                isLoadingAlternatives = true
+                                scope.launch {
+                                    onSuggestAlternatives(name, initial.brandName, score, negativesSummary)
+                                        .onSuccess { swaps -> alternatives = swaps }
+                                    isLoadingAlternatives = false
                                 }
-                                Surface(color = scoreColor.copy(alpha = 0.2f), shape = RoundedCornerShape(8.dp)) {
-                                    Text(
-                                        text = "Nutri-Score ${initial.nutriscore}",
-                                        color = scoreColor,
-                                        fontWeight = FontWeight.ExtraBold,
-                                        style = MaterialTheme.typography.labelMedium,
-                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                                    )
-                                }
-                                if (initial.novaGroup > 0) {
-                                    Surface(color = Color.White.copy(alpha = 0.08f), shape = RoundedCornerShape(8.dp)) {
-                                        Text(
-                                            text = "NOVA ${initial.novaGroup}",
-                                            color = TextPrimary,
-                                            fontWeight = FontWeight.Bold,
-                                            style = MaterialTheme.typography.labelMedium,
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                                        )
+                            }
+                        } else null,
+                        isAnalyzingAi = isAnalyzingIngredients,
+                        onRunAiDeepDive = if (onAnalyzeIngredients != null) {
+                            {
+                                isAnalyzingIngredients = true
+                                ingredientError = null
+                                scope.launch {
+                                    val queryText = initial.ingredients.ifBlank {
+                                        additiveDetails.joinToString(", ") { "${it.code} (${it.name})" }
                                     }
+                                    onAnalyzeIngredients(name, queryText)
+                                        .onSuccess { analysis ->
+                                            healthScore = analysis.healthScore
+                                            healthVerdict = analysis.healthVerdict
+                                            ingredientFacts = analysis.ingredientFacts
+                                            if (analysis.additiveDetails.isNotEmpty()) {
+                                                additiveDetails = analysis.additiveDetails
+                                            }
+                                            if (analysis.modelUsed.isNotBlank()) {
+                                                activeModelBadge = analysis.modelUsed
+                                            }
+                                        }
+                                        .onFailure { err ->
+                                            ingredientError = err.message
+                                        }
+                                    isAnalyzingIngredients = false
                                 }
                             }
-                            Text(
-                                text = if (initial.additivesCount > 0) "⚠️ ${initial.additivesCount} Additives detected" else "✅ Additive-free",
-                                color = if (initial.additivesCount > 0) Color(0xFFF87171) else AccentEmerald,
-                                style = MaterialTheme.typography.bodySmall,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            if (initial.ingredients.isNotBlank()) {
-                                Text(
-                                    text = initial.ingredients,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = TextSecondary,
-                                    maxLines = 4,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                    }
+                        } else null
+                    )
+                }
+
+                ingredientError?.let { err ->
+                    Text(err, color = Color(0xFFFCA5A5), style = MaterialTheme.typography.labelSmall)
                 }
 
                 if (initial.confidenceNote.isNotBlank()) {
@@ -305,7 +399,7 @@ fun ReviewNutritionDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    val finalName = if (isBarcode && !isEditing) "$name (${portionGrams}g)" else name
+                    val finalName = if (showGramInput) "$name (${portionGrams}g)" else name
                     onConfirm(
                         initial.copy(
                             mealName = finalName.ifBlank { "Meal" },
@@ -314,7 +408,12 @@ fun ReviewNutritionDialog(
                             carbsGrams = carbs.toDoubleOrNull() ?: initial.carbsGrams,
                             fatGrams = fat.toDoubleOrNull() ?: initial.fatGrams,
                             fiberGrams = fiber.toDoubleOrNull() ?: initial.fiberGrams,
-                            subItems = subItems
+                            subItems = subItems,
+                            healthScore = healthScore,
+                            healthVerdict = healthVerdict,
+                            ingredientFacts = ingredientFacts,
+                            additiveDetails = additiveDetails,
+                            alternatives = alternatives
                         ),
                         selectedCategory
                     )

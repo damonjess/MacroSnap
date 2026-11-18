@@ -157,7 +157,7 @@ fun MacroSnapApp(
     }
 
     val todayEpochDay = LocalDate.now().toEpochDay()
-    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Today, 1 = Trends
+    var selectedTab by remember { mutableIntStateOf(0) }
     var selectedEpochDay by remember { mutableLongStateOf(todayEpochDay) }
     val dayLogs by dao.observeLogsForDay(selectedEpochDay).collectAsState(initial = emptyList())
     val dayMetricsState by dao.observeMetricsForDay(selectedEpochDay).collectAsState(initial = null)
@@ -165,7 +165,7 @@ fun MacroSnapApp(
     val recentLogs by dao.observeRecentLogs().collectAsState(initial = emptyList())
 
     var showCamera by remember { mutableStateOf(false) }
-    var cameraLabelOcrMode by remember { mutableStateOf(false) }
+    var cameraCaptureMode by remember { mutableStateOf(ScannerCaptureMode.MEAL_OR_BARCODE) }
     var showActivityDialog by remember { mutableStateOf(false) }
     var showQuickAddDialog by remember { mutableStateOf(false) }
     var quickAddInitialManual by remember { mutableStateOf(false) }
@@ -182,11 +182,11 @@ fun MacroSnapApp(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) showCamera = true
-        else errorMessage = "Camera permission is required to scan meals and barcodes."
+        else errorMessage = "Camera permission is required to scan meals, labels, and barcodes."
     }
 
-    fun launchScanner(labelOcr: Boolean = false) {
-        cameraLabelOcrMode = labelOcr
+    fun launchScanner(mode: ScannerCaptureMode = ScannerCaptureMode.MEAL_OR_BARCODE) {
+        cameraCaptureMode = mode
         val granted = ContextCompat.checkSelfPermission(
             context, Manifest.permission.CAMERA
         ) == PackageManager.PERMISSION_GRANTED
@@ -194,12 +194,11 @@ fun MacroSnapApp(
         else cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
-    // Handle widget "Scan" button launch
     LaunchedEffect(openScannerTrigger) {
         if (openScannerTrigger > 0) {
             selectedTab = 0
             selectedEpochDay = LocalDate.now().toEpochDay()
-            launchScanner(labelOcr = false)
+            launchScanner(ScannerCaptureMode.MEAL_OR_BARCODE)
         }
     }
 
@@ -230,32 +229,36 @@ fun MacroSnapApp(
         }
     }
 
-    // Auto-sync hardware step sensor on launch when viewing Today
     LaunchedEffect(Unit) {
         syncTodayStepsFromSensor()
     }
 
     if (showCamera) {
         CameraScannerScreen(
-            initialLabelOcrMode = cameraLabelOcrMode,
-            onPhotoCaptured = { bitmap, userHint, isLabelOcr ->
+            initialCaptureMode = cameraCaptureMode,
+            onPhotoCaptured = { bitmap, userHint, captureMode ->
                 showCamera = false
                 isLoading = true
-                loadingMessage = if (isLabelOcr) {
-                    "Reading Nutrition Facts label..."
-                } else {
-                    "Analyzing meal portions & macros..."
+                loadingMessage = when (captureMode) {
+                    ScannerCaptureMode.INGREDIENTS_OCR -> "Scanning ingredients & evaluating Good vs. Bad facts..."
+                    ScannerCaptureMode.NUTRITION_LABEL_OCR -> "Reading Nutrition Facts label..."
+                    ScannerCaptureMode.MEAL_OR_BARCODE -> "Analyzing meal portions & macros..."
                 }
                 errorMessage = null
                 scope.launch {
                     val savedPhotoPath = withContext(Dispatchers.IO) {
                         NutritionRepository.saveMealThumbnail(context, bitmap)
                     }
-                    repo.analyzeMealPhoto(bitmap, userHint = userHint, isNutritionLabelOcr = isLabelOcr)
+                    repo.analyzeMealPhoto(bitmap, userHint = userHint, captureMode = captureMode)
                         .onSuccess { result ->
+                            val sourceTag = when (captureMode) {
+                                ScannerCaptureMode.INGREDIENTS_OCR -> "INGREDIENTS_OCR"
+                                ScannerCaptureMode.NUTRITION_LABEL_OCR -> "LABEL_OCR"
+                                ScannerCaptureMode.MEAL_OR_BARCODE -> "AI_PHOTO"
+                            }
                             pendingDraft = PendingMealDraft(
                                 result = result.copy(photoPath = savedPhotoPath),
-                                source = if (isLabelOcr) "LABEL_OCR" else "AI_PHOTO"
+                                source = sourceTag
                             )
                         }
                         .onFailure { errorMessage = it.message }
@@ -379,7 +382,7 @@ fun MacroSnapApp(
         floatingActionButton = {
             if (selectedTab == 0) {
                 ExtendedFloatingActionButton(
-                    onClick = { launchScanner(labelOcr = false) },
+                    onClick = { launchScanner(ScannerCaptureMode.MEAL_OR_BARCODE) },
                     containerColor = AccentEmerald,
                     contentColor = Color(0xFF042F2E),
                     shape = RoundedCornerShape(20.dp),
@@ -407,7 +410,6 @@ fun MacroSnapApp(
                 verticalArrangement = Arrangement.spacedBy(14.dp),
                 contentPadding = PaddingValues(bottom = 104.dp)
             ) {
-                // Date Navigation Bar
                 item {
                     Surface(
                         color = CardDark,
@@ -441,7 +443,6 @@ fun MacroSnapApp(
                     }
                 }
 
-                // Calorie Ring + Macro Progress Card
                 item {
                     Surface(
                         color = CardDark,
@@ -533,7 +534,6 @@ fun MacroSnapApp(
                     }
                 }
 
-                // Hydration & Activity Cards
                 item {
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Surface(
@@ -651,7 +651,7 @@ fun MacroSnapApp(
                     }
                 }
 
-                // Fast Logging & Weight Check-In Strip
+                // 4-Button Quick Action Strip (Quick Add, Ingredients Scan, Favorites, Weight)
                 item {
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         QuickActionButton(
@@ -665,15 +665,22 @@ fun MacroSnapApp(
                             modifier = Modifier.weight(1f)
                         )
                         QuickActionButton(
+                            icon = Icons.Default.Science,
+                            label = "Ingredients",
+                            tint = FatAmber,
+                            onClick = { launchScanner(ScannerCaptureMode.INGREDIENTS_OCR) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        QuickActionButton(
                             icon = Icons.Default.History,
                             label = "Favorites",
-                            tint = FatAmber,
+                            tint = AccentCyan,
                             onClick = { showRecentDialog = true },
                             modifier = Modifier.weight(1f)
                         )
                         QuickActionButton(
                             icon = Icons.Default.MonitorWeight,
-                            label = metrics.weightKg?.let { "${"%.1f".format(it)} kg" } ?: "Weight",
+                            label = metrics.weightKg?.let { "${"%.1f".format(it)}kg" } ?: "Weight",
                             tint = FiberPurple,
                             onClick = { showWeightDialog = true },
                             modifier = Modifier.weight(1f)
@@ -748,7 +755,7 @@ fun MacroSnapApp(
                                 Icon(Icons.Default.Restaurant, contentDescription = null, tint = TextSecondary.copy(alpha = 0.5f), modifier = Modifier.size(32.dp))
                                 Text("No meals logged for $dateLabel", fontWeight = FontWeight.SemiBold, color = TextPrimary)
                                 Text(
-                                    "Tap 'Scan Meal / Barcode' or 'Quick Add' to log your food.",
+                                    "Tap 'Scan Meal / Barcode', 'Ingredients', or 'Quick Add' to log or inspect food.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = TextSecondary
                                 )
@@ -756,7 +763,6 @@ fun MacroSnapApp(
                         }
                     }
                 } else {
-                    // Group logs by MealCategory with per-category calorie subtotals
                     val grouped = MealCategory.entries.mapNotNull { cat ->
                         val catLogs = dayLogs.filter { MealCategory.fromString(it.category) == cat }
                         if (catLogs.isEmpty()) null else cat to catLogs
@@ -825,7 +831,6 @@ fun MacroSnapApp(
         }
     }
 
-    // Activity & Hardware Step Sync Dialog
     if (showActivityDialog) {
         var stepsText by remember { mutableStateOf(if (metrics.steps == 0) "" else metrics.steps.toString()) }
         var activeCalsText by remember { mutableStateOf(if (metrics.activeCalories == 0) "" else metrics.activeCalories.toString()) }
@@ -917,7 +922,6 @@ fun MacroSnapApp(
         )
     }
 
-    // Weight Check-In Dialog
     if (showWeightDialog) {
         var weightText by remember {
             mutableStateOf(
@@ -961,7 +965,6 @@ fun MacroSnapApp(
         )
     }
 
-    // Quick Add / AI Text Description Dialog
     if (showQuickAddDialog) {
         QuickAddMealDialog(
             initialManualMode = quickAddInitialManual,
@@ -1002,7 +1005,6 @@ fun MacroSnapApp(
         )
     }
 
-    // Recent & Favorites Re-log Dialog
     if (showRecentDialog) {
         RecentAndFavoritesDialog(
             recentLogs = recentLogs,
@@ -1029,7 +1031,6 @@ fun MacroSnapApp(
         )
     }
 
-    // Barcode Not Found -> Nutrition Label OCR Fallback Dialog
     missingBarcodePrompt?.let { barcode ->
         AlertDialog(
             containerColor = CardDark,
@@ -1037,19 +1038,28 @@ fun MacroSnapApp(
             title = { Text("Barcode Not Found", fontWeight = FontWeight.ExtraBold) },
             text = {
                 Text(
-                    "Product ($barcode) isn't in Open Food Facts yet. Snap the package's Nutrition Facts label instead and AI will read the macros automatically.",
+                    "Product ($barcode) isn't in Open Food Facts yet. You can snap the Nutrition Facts table or the Ingredients list instead.",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary
                 )
             },
             confirmButton = {
-                Button(
-                    onClick = {
-                        missingBarcodePrompt = null
-                        launchScanner(labelOcr = true)
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = AccentCyan, contentColor = Color(0xFF042F2E))
-                ) { Text("Scan Nutrition Label", fontWeight = FontWeight.Bold) }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            missingBarcodePrompt = null
+                            launchScanner(ScannerCaptureMode.NUTRITION_LABEL_OCR)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentCyan, contentColor = Color(0xFF042F2E))
+                    ) { Text("Macros Label", fontWeight = FontWeight.Bold) }
+                    Button(
+                        onClick = {
+                            missingBarcodePrompt = null
+                            launchScanner(ScannerCaptureMode.INGREDIENTS_OCR)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = FatAmber, contentColor = Color(0xFF042F2E))
+                    ) { Text("Ingredients", fontWeight = FontWeight.Bold) }
+                }
             },
             dismissButton = {
                 TextButton(onClick = {
@@ -1061,14 +1071,20 @@ fun MacroSnapApp(
         )
     }
 
-    // Review / Edit Meal Dialog
     pendingDraft?.let { draft ->
         ReviewNutritionDialog(
             initial = draft.result,
             isBarcode = draft.source == "BARCODE",
+            isLabelOrIngredientsOcr = draft.source == "LABEL_OCR" || draft.source == "INGREDIENTS_OCR",
             initialCategory = draft.editingLog?.let { MealCategory.fromString(it.category) }
                 ?: MealCategory.defaultForTimestamp(),
             isEditing = draft.editingLog != null,
+            onAnalyzeIngredients = { productName, ingredientsText ->
+                repo.analyzeIngredientsText(productName, ingredientsText)
+            },
+            onSuggestAlternatives = { productName, brandName, score, negativesSummary ->
+                repo.suggestHealthierAlternatives(productName, brandName, score, negativesSummary)
+            },
             onDismiss = { pendingDraft = null },
             onConfirm = { edited, category ->
                 scope.launch {
@@ -1129,14 +1145,21 @@ private fun QuickActionButton(
         border = BorderStroke(1.dp, Color.White.copy(alpha = 0.06f)),
         modifier = modifier
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
+        Column(
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(6.dp))
-            Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(18.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis
+            )
         }
     }
 }
@@ -1179,6 +1202,7 @@ private fun MealLogCard(
                 val (badgeColor, badgeIcon) = when (log.source) {
                     "BARCODE" -> AccentCyan to Icons.Default.QrCode2
                     "LABEL_OCR" -> AccentCyan to Icons.Default.DocumentScanner
+                    "INGREDIENTS_OCR" -> FatAmber to Icons.Default.Science
                     "AI_TEXT" -> AccentEmerald to Icons.Default.AutoAwesome
                     "MANUAL" -> FiberPurple to Icons.Default.Edit
                     else -> AccentEmerald to Icons.Default.CameraAlt
